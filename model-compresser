@@ -1,0 +1,1123 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10,<3.15"
+# dependencies = [
+#   "numpy>=1.26",
+#   "pymeshlab>=2023.12",
+#   "trimesh>=4.4",
+#   "pillow>=10.0",
+# ]
+# ///
+#
+###################################################################################################
+#
+#    MODEL-COMPRESSER -- Make 3D cave models smaller for sharing
+#
+#    Copyright (C) 2026 by Jari Arkko -- See LICENSE for license information.
+#
+###################################################################################################
+#
+# The pipeline is:
+#
+#   1. read the model with trimesh (GLB/glTF, OBJ, PLY, STL, ...), baking node
+#      transforms and collecting one "part" per material;
+#   2. hand the geometry to MeshLab (pymeshlab) through a binary PLY that carries
+#      per-corner ("wedge") texture coordinates and a per-face texture index --
+#      MeshLab's own PLY convention -- so that multi-texture models stay intact;
+#   3. in MeshLab: weld duplicate vertices (scanner exports typically store every
+#      triangle with its own three vertices, which also makes decimation
+#      impossible), clean up, and simplify with quadric edge collapse -- the same
+#      algorithm as Blender's Decimate modifier in Collapse mode, in MeshLab's
+#      texture-aware variant that keeps UV seams consistent;
+#   4. shrink and re-encode the textures as JPEG;
+#   5. write a compact binary GLB (or OBJ/PLY/STL) with our own writers, so
+#      that we control exactly what ends up in the file.
+#
+###################################################################################################
+
+import argparse
+import gc
+import io
+import json
+import os
+import struct
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+
+import numpy as np
+
+PROGRAM = "model-compresser"
+VERSION = "0.1.0"
+
+MESH_OUTPUT_FORMATS = (".glb", ".obj", ".ply", ".stl")
+POINT_OUTPUT_FORMATS = (".glb", ".ply")
+
+QUIET = False
+
+
+# ------------------------------------------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------------------------------------------
+
+def log(text):
+    if not QUIET:
+        print(f"{PROGRAM}: {text}", flush=True)
+
+
+def warn(text):
+    print(f"{PROGRAM}: warning: {text}", file=sys.stderr, flush=True)
+
+
+def fail(text, status=1):
+    print(f"{PROGRAM}: error: {text}", file=sys.stderr, flush=True)
+    sys.exit(status)
+
+
+def human_size(nbytes):
+    nbytes = float(nbytes)
+    for unit in ("bytes", "kB", "MB", "GB"):
+        if nbytes < 1000 or unit == "GB":
+            return f"{nbytes:.0f} {unit}" if unit == "bytes" else f"{nbytes:.1f} {unit}"
+        nbytes /= 1000.0
+
+
+def ext_of(path):
+    return os.path.splitext(path)[1].lower()
+
+
+class Timer:
+    def __init__(self):
+        self.start = time.time()
+
+    def __str__(self):
+        return f"{time.time() - self.start:.1f} s"
+
+
+# ------------------------------------------------------------------------------------------------
+# In-memory model: a list of parts, each with one material
+# ------------------------------------------------------------------------------------------------
+
+@dataclass
+class Texture:
+    data: bytes
+    mime: str
+    ext: str
+    size: tuple
+
+
+@dataclass
+class Material:
+    name: str
+    image: object = None          # PIL.Image.Image, or None
+    color: tuple = None           # RGBA, floats in 0..1, or None
+    double_sided: bool = False
+    roughness: float = 1.0
+    texture: Texture = None       # filled in when textures are encoded for output
+
+
+@dataclass
+class Part:
+    name: str
+    vertices: np.ndarray          # (n, 3) float32
+    faces: np.ndarray = None      # (m, 3) int32; None for a point cloud
+    uv: np.ndarray = None         # (n, 2) float32, OBJ convention (origin bottom-left)
+    colors: np.ndarray = None     # (n, 4) uint8
+    normals: np.ndarray = None    # (n, 3) float32
+    material: Material = None
+
+
+@dataclass
+class Model:
+    parts: list = field(default_factory=list)
+
+    @property
+    def is_point_cloud(self):
+        return all(p.faces is None for p in self.parts)
+
+    @property
+    def vertex_count(self):
+        return sum(len(p.vertices) for p in self.parts)
+
+    @property
+    def triangle_count(self):
+        return sum(len(p.faces) for p in self.parts if p.faces is not None)
+
+    @property
+    def textured(self):
+        return any(p.uv is not None and p.material is not None and p.material.image is not None
+                   for p in self.parts)
+
+    @property
+    def colored(self):
+        return any(p.colors is not None for p in self.parts)
+
+    def images(self):
+        """The distinct texture images, in first-use order."""
+        seen, result = set(), []
+        for p in self.parts:
+            img = p.material.image if p.material is not None else None
+            if img is not None and id(img) not in seen:
+                seen.add(id(img))
+                result.append(img)
+        return result
+
+
+# ------------------------------------------------------------------------------------------------
+# Reading
+# ------------------------------------------------------------------------------------------------
+
+def convert_material(mat):
+    """Turn a trimesh material (PBR or OBJ-style simple material) into ours."""
+    if mat is None:
+        return Material("material")
+    name = getattr(mat, "name", None) or "material"
+    image = getattr(mat, "baseColorTexture", None)
+    if image is None:
+        image = getattr(mat, "image", None)
+    factor = getattr(mat, "baseColorFactor", None)
+    if factor is None and image is None:
+        try:
+            factor = mat.main_color
+        except Exception:
+            factor = None
+    color = None
+    if factor is not None:
+        f = np.asarray(factor, dtype=np.float64).ravel()
+        if f.size >= 3:
+            if f.max() > 1.0:
+                f = f / 255.0
+            color = (float(f[0]), float(f[1]), float(f[2]), float(f[3]) if f.size > 3 else 1.0)
+    roughness = getattr(mat, "roughnessFactor", None)
+    roughness = 1.0 if roughness is None else float(roughness)
+    return Material(name, image, color, bool(getattr(mat, "doubleSided", False)), roughness)
+
+
+def load_model(path):
+    import trimesh
+
+    ext = ext_of(path)
+    if ext in (".usdz", ".usd", ".usda", ".usdc"):
+        fail(f"'{path}': USD files are not supported; export the model as GLB or OBJ first "
+             "(e.g. with Blender or Apple's Reality Converter)")
+    try:
+        scene = trimesh.load(path, force="scene", process=False)
+    except Exception as e:
+        fail(f"cannot read '{path}': {e}")
+
+    model = Model()
+    # Walk the scene graph and apply the node transforms ourselves rather than using
+    # scene.dump(): dump() copies every geometry, and copying a material decodes its
+    # texture at full resolution -- gigabytes for a scan with many 8192x8192 images.
+    graph = scene.graph
+    for node_name in graph.nodes_geometry:
+        transform, geometry_name = graph[node_name]
+        geom = scene.geometry.get(geometry_name)
+        if geom is None:
+            continue
+        name = geometry_name or node_name or f"part{len(model.parts)}"
+        vertices = np.asarray(geom.vertices, dtype=np.float64)
+        if len(vertices) == 0:
+            continue
+        if transform is not None and not np.allclose(transform, np.eye(4)):
+            matrix = np.asarray(transform, dtype=np.float64)
+            vertices = vertices @ matrix[:3, :3].T + matrix[:3, 3]
+        vertices = vertices.astype(np.float32)
+        if isinstance(geom, trimesh.PointCloud):
+            colors = None
+            try:
+                c = np.asarray(geom.colors, dtype=np.uint8)
+                if c.shape == (len(vertices), 4):
+                    colors = c
+            except Exception:
+                pass
+            model.parts.append(Part(name, vertices, None, colors=colors))
+            continue
+        if not isinstance(geom, trimesh.Trimesh):
+            warn(f"skipping '{name}': unsupported geometry type {type(geom).__name__}")
+            continue
+        faces = np.asarray(geom.faces, dtype=np.int32)
+        if len(faces) == 0:
+            model.parts.append(Part(name, vertices, None))
+            continue
+        uv = colors = None
+        material = None
+        visual = getattr(geom, "visual", None)
+        kind = getattr(visual, "kind", None)
+        if kind == "texture":
+            uv = getattr(visual, "uv", None)
+            if uv is not None:
+                uv = np.asarray(uv, dtype=np.float32)
+                if uv.shape != (len(vertices), 2):
+                    uv = None
+            material = convert_material(getattr(visual, "material", None))
+        elif kind in ("vertex", "face"):
+            colors = np.asarray(visual.vertex_colors, dtype=np.uint8)
+            if colors.shape != (len(vertices), 4):
+                colors = None
+        if material is None:
+            material = Material("material")
+        if material.image is None:
+            uv = None           # texture coordinates are useless without a texture
+        model.parts.append(Part(name, vertices, faces, uv=uv, colors=colors, material=material))
+
+    # trimesh's objects form reference cycles that keep the file buffer and float64
+    # copies of everything alive; collect them now, not in the middle of MeshLab's work
+    del scene, graph
+    gc.collect()
+    if not model.parts:
+        fail(f"'{path}': no geometry found")
+    if any(p.faces is None for p in model.parts) and not model.is_point_cloud:
+        # mixed point clouds and meshes: keep the meshes only
+        dropped = sum(1 for p in model.parts if p.faces is None)
+        warn(f"ignoring {dropped} point-only part(s) in a mesh model")
+        model.parts = [p for p in model.parts if p.faces is not None]
+    return model
+
+
+def describe_images(images):
+    if not images:
+        return "no textures"
+    sizes = {}
+    for img in images:
+        sizes[img.size] = sizes.get(img.size, 0) + 1
+    detail = ", ".join(f"{n} x {w}x{h}" for (w, h), n in sorted(sizes.items(), reverse=True))
+    return f"{len(images)} texture{'s' if len(images) != 1 else ''} ({detail})"
+
+
+def describe_model(model):
+    if model.is_point_cloud:
+        return (f"point cloud, {model.vertex_count:,} points"
+                + (", with colors" if model.colored else ""))
+    text = (f"{len(model.parts)} part{'s' if len(model.parts) != 1 else ''}, "
+            f"{model.triangle_count:,} triangles, {model.vertex_count:,} vertices, "
+            + describe_images(model.images()))
+    if model.colored:
+        text += ", vertex colors"
+    return text
+
+
+# ------------------------------------------------------------------------------------------------
+# PLY interchange with MeshLab (binary little endian, wedge texcoords + texnumber)
+# ------------------------------------------------------------------------------------------------
+
+PLY_TYPES = {"char": "i1", "uchar": "u1", "short": "i2", "ushort": "u2", "int": "i4", "uint": "u4",
+             "float": "f4", "double": "f8", "int8": "i1", "uint8": "u1", "int16": "i2",
+             "uint16": "u2", "int32": "i4", "uint32": "u4", "float32": "f4", "float64": "f8"}
+
+
+def write_interchange_ply(path, vertices, faces, wedge_uv, texnumber, colors, ntextures):
+    vfields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+    header = ["ply", "format binary_little_endian 1.0", f"comment {PROGRAM} {VERSION}"]
+    header += [f"comment TextureFile texture_{i}.jpg" for i in range(ntextures)]
+    header += [f"element vertex {len(vertices)}",
+               "property float x", "property float y", "property float z"]
+    if colors is not None:
+        vfields += [("red", "u1"), ("green", "u1"), ("blue", "u1")]
+        header += ["property uchar red", "property uchar green", "property uchar blue"]
+    varr = np.empty(len(vertices), dtype=np.dtype(vfields))
+    varr["x"], varr["y"], varr["z"] = vertices[:, 0], vertices[:, 1], vertices[:, 2]
+    if colors is not None:
+        varr["red"], varr["green"], varr["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
+
+    ffields = [("n", "u1"), ("v", "<i4", (3,))]
+    header += [f"element face {len(faces)}", "property list uchar int vertex_indices"]
+    if wedge_uv is not None:
+        ffields += [("m", "u1"), ("t", "<f4", (6,)), ("tn", "<i4")]
+        header += ["property list uchar float texcoord", "property int texnumber"]
+    farr = np.empty(len(faces), dtype=np.dtype(ffields))
+    farr["n"] = 3
+    farr["v"] = faces
+    if wedge_uv is not None:
+        farr["m"] = 6
+        farr["t"] = wedge_uv
+        farr["tn"] = texnumber
+    header += ["end_header", ""]
+    with open(path, "wb") as f:
+        f.write("\n".join(header).encode("ascii"))
+        f.write(varr.tobytes())
+        f.write(farr.tobytes())
+
+
+def read_interchange_ply(path):
+    """Read the binary PLY MeshLab wrote back. Returns a dict of numpy arrays."""
+    with open(path, "rb") as f:
+        data = f.read()
+    end = data.index(b"end_header\n") + len(b"end_header\n")
+    elements = []
+    for line in data[:end].decode("ascii", "replace").splitlines():
+        tok = line.split()
+        if not tok:
+            continue
+        if tok[0] == "format" and tok[1] != "binary_little_endian":
+            fail(f"unexpected PLY format '{tok[1]}' from MeshLab")
+        elif tok[0] == "element":
+            elements.append((tok[1], int(tok[2]), []))
+        elif tok[0] == "property":
+            if tok[1] == "list":
+                elements[-1][2].append((tok[4], PLY_TYPES[tok[2]], PLY_TYPES[tok[3]]))
+            else:
+                elements[-1][2].append((tok[2], PLY_TYPES[tok[1]], None))
+    list_lengths = {"vertex_indices": 3, "vertex_index": 3, "texcoord": 6}
+    result, offset = {}, end
+    for name, count, props in elements:
+        fields = []
+        for pname, ctype, itype in props:
+            if itype is None:
+                fields.append((pname, "<" + ctype))
+            else:
+                if pname not in list_lengths:
+                    fail(f"unexpected list property '{pname}' in MeshLab output")
+                fields.append((pname + "__count", "<" + ctype))
+                fields.append((pname, "<" + itype, (list_lengths[pname],)))
+        dtype = np.dtype(fields)
+        arr = np.frombuffer(data, dtype=dtype, count=count, offset=offset)
+        offset += dtype.itemsize * count
+        for pname, ctype, itype in props:
+            if itype is not None and count and not (arr[pname + "__count"] == list_lengths[pname]).all():
+                fail(f"MeshLab output has a non-triangular '{pname}' list")
+        result[name] = arr
+    if offset != len(data):
+        fail("MeshLab output PLY has unexpected trailing data")
+    return result
+
+
+# ------------------------------------------------------------------------------------------------
+# Geometry processing
+# ------------------------------------------------------------------------------------------------
+
+def material_key(m):
+    return (id(m.image) if m.image is not None else None, m.color, m.double_sided, round(m.roughness, 3))
+
+
+def combine_parts(model):
+    """Concatenate all parts into one mesh, with one material index per face."""
+    materials, index_of = [], {}
+    textured, colored = model.textured, model.colored
+    vlist, flist, wlist, tlist, clist = [], [], [], [], []
+    offset = 0
+    for part in model.parts:
+        key = material_key(part.material)
+        if key not in index_of:
+            index_of[key] = len(materials)
+            materials.append(part.material)
+        mi = index_of[key]
+        vlist.append(part.vertices)
+        flist.append(part.faces.astype(np.int64) + offset)
+        if textured:
+            if part.uv is not None and part.material.image is not None:
+                uv = np.nan_to_num(part.uv.astype(np.float32))
+                wlist.append(uv[part.faces].reshape(-1, 6))
+            else:
+                wlist.append(np.zeros((len(part.faces), 6), dtype=np.float32))
+            tlist.append(np.full(len(part.faces), mi, dtype=np.int32))
+        if colored:
+            if part.colors is not None:
+                clist.append(part.colors[:, :3])
+            else:
+                clist.append(np.full((len(part.vertices), 3), 255, dtype=np.uint8))
+        offset += len(part.vertices)
+    mesh = {"vertices": np.concatenate(vlist).astype(np.float32),
+            "faces": np.concatenate(flist).astype(np.int32),
+            "wedge": np.concatenate(wlist) if textured else None,
+            "texnumber": np.concatenate(tlist) if textured else None,
+            "colors": np.concatenate(clist) if colored else None}
+    return materials, mesh
+
+
+def compute_target_faces(nfaces, args):
+    if args.faces is not None:
+        return max(4, int(args.faces))
+    return max(4, int(round(nfaces * args.ratio)))
+
+
+def simplify_mesh(mesh, materials, args, tmpdir):
+    """Weld, clean and decimate with MeshLab. Empties `mesh` and returns the new arrays."""
+    import pymeshlab
+
+    vertices, faces, wedge, texnumber, colors = (mesh[k] for k in
+                                                 ("vertices", "faces", "wedge", "texnumber", "colors"))
+    textured, colored = wedge is not None, colors is not None
+    nverts, nfaces = len(vertices), len(faces)
+    pin = os.path.join(tmpdir, "in.ply")
+    pout = os.path.join(tmpdir, "out.ply")
+    t = Timer()
+    write_interchange_ply(pin, vertices, faces, wedge, texnumber, colors, len(materials))
+    del vertices, faces, wedge, texnumber, colors
+    mesh.clear()                        # MeshLab has its own copy now; free ours
+    ms = pymeshlab.MeshSet()
+    ms.load_new_mesh(pin)
+    if args.verbose:
+        log(f"handed {nfaces:,} triangles to MeshLab ({t})")
+
+    t = Timer()
+    if args.weld:
+        ms.meshing_remove_duplicate_vertices()
+    if args.weld_distance > 0:
+        ms.meshing_merge_close_vertices(threshold=pymeshlab.PureValue(args.weld_distance))
+    ms.meshing_remove_duplicate_faces()
+    ms.meshing_remove_null_faces()
+    if args.min_part_size > 1:
+        ms.meshing_remove_connected_component_by_face_number(mincomponentsize=int(args.min_part_size),
+                                                             removeunref=True)
+    ms.meshing_remove_unreferenced_vertices()
+    m = ms.current_mesh()
+    welded_verts, welded_faces = m.vertex_number(), m.face_number()
+    if args.weld or args.weld_distance > 0:
+        log(f"welded vertices: {nverts:,} -> {welded_verts:,}"
+            + (f", removed {nfaces - welded_faces:,} degenerate or duplicate triangles"
+               if welded_faces != nfaces else "")
+            + (f" ({t})" if args.verbose else ""))
+    elif welded_faces != nfaces:
+        log(f"removed {nfaces - welded_faces:,} degenerate, duplicate or tiny-fragment triangles")
+
+    target = compute_target_faces(welded_faces, args)
+    if target < welded_faces:
+        t = Timer()
+        if textured:
+            ms.meshing_decimation_quadric_edge_collapse_with_texture(
+                targetfacenum=int(target), qualitythr=0.3, extratcoordw=1.0,
+                preserveboundary=True, boundaryweight=1.0, optimalplacement=True,
+                preservenormal=True, planarquadric=True)
+        else:
+            ms.meshing_decimation_quadric_edge_collapse(
+                targetfacenum=int(target), qualitythr=0.3,
+                preserveboundary=True, boundaryweight=1.0, preservenormal=True,
+                preservetopology=False, optimalplacement=True, planarquadric=True,
+                autoclean=True)
+        ms.meshing_remove_unreferenced_vertices()
+        m = ms.current_mesh()
+        log(f"simplified: {welded_faces:,} -> {m.face_number():,} triangles "
+            f"({100.0 * m.face_number() / max(1, welded_faces):.1f}%), "
+            f"{welded_verts:,} -> {m.vertex_number():,} vertices"
+            + (f" ({t})" if args.verbose else ""))
+    else:
+        log(f"no simplification needed: {welded_faces:,} triangles is already within the target")
+
+    if m.face_number() == 0:
+        fail("nothing left after simplification")
+    ms.save_current_mesh(pout, binary=True, save_vertex_color=colored,
+                         save_vertex_normal=False, save_wedge_texcoord=textured,
+                         save_face_color=False)
+    ms.clear()
+    ply = read_interchange_ply(pout)
+    v, f = ply["vertex"], ply["face"]
+    result = {"vertices": np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float32),
+              "faces": np.asarray(f["vertex_indices"], dtype=np.int32),
+              "wedge": None, "texnumber": None, "colors": None}
+    if colored and "red" in v.dtype.names:
+        result["colors"] = np.stack([v["red"], v["green"], v["blue"]], axis=1).astype(np.uint8)
+    if textured:
+        result["wedge"] = np.asarray(f["texcoord"], dtype=np.float32)
+        if "texnumber" in f.dtype.names:
+            result["texnumber"] = np.asarray(f["texnumber"], dtype=np.int32)
+        else:
+            result["texnumber"] = np.zeros(len(result["faces"]), dtype=np.int32)
+    return result
+
+
+def vertex_normals(vertices, faces):
+    """Area-weighted smooth vertex normals."""
+    tri = vertices[faces].astype(np.float64)
+    fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    normals = np.zeros((len(vertices), 3), dtype=np.float64)
+    idx = faces.ravel()
+    for c in range(3):
+        normals[:, c] = np.bincount(idx, weights=np.repeat(fn[:, c], 3), minlength=len(vertices))
+    length = np.linalg.norm(normals, axis=1)
+    ok = length > 0
+    normals[ok] /= length[ok, None]
+    normals[~ok] = (0.0, 0.0, 1.0)
+    return normals.astype(np.float32)
+
+
+def split_by_material(vertices, faces, wedge, texnumber, colors, normals, materials):
+    """Build one output part per material, splitting vertices along UV seams."""
+    parts = []
+    groups = [0] if texnumber is None else np.unique(texnumber).tolist()
+    for mi in groups:
+        sel = slice(None) if texnumber is None else (texnumber == mi)
+        f = faces[sel]
+        if len(f) == 0:
+            continue
+        material = materials[mi] if mi < len(materials) else materials[0]
+        if wedge is not None and material.image is not None:
+            w = wedge[sel].reshape(-1, 3, 2)
+            keys = np.empty(f.size, dtype=[("v", "<i4"), ("u", "<f4"), ("t", "<f4")])
+            keys["v"] = f.ravel()
+            keys["u"] = w[:, :, 0].ravel()
+            keys["t"] = w[:, :, 1].ravel()
+            uniq, inverse = np.unique(keys, return_inverse=True)
+            vidx = uniq["v"]
+            uv = np.stack([uniq["u"], uniq["t"]], axis=1).astype(np.float32)
+        else:
+            vidx, inverse = np.unique(f.ravel(), return_inverse=True)
+            uv = None
+        new_faces = inverse.reshape(-1, 3).astype(np.int32)
+        parts.append(Part(material.name, vertices[vidx], new_faces, uv=uv,
+                          colors=None if colors is None else
+                          np.concatenate([colors[vidx], np.full((len(vidx), 1), 255, np.uint8)], axis=1),
+                          normals=None if normals is None else normals[vidx],
+                          material=material))
+    return parts
+
+
+# ------------------------------------------------------------------------------------------------
+# Textures
+# ------------------------------------------------------------------------------------------------
+
+def encode_texture(image, max_size, quality):
+    from PIL import Image
+
+    w, h = image.size
+    scale = 1.0 if max_size <= 0 else min(1.0, max_size / float(max(w, h)))
+    tw, th = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    has_alpha = ("A" in image.getbands()) or (image.mode == "P" and "transparency" in image.info)
+    if has_alpha:
+        image = image.convert("RGBA")
+        has_alpha = int(np.asarray(image.getchannel("A")).min()) < 255
+    if not has_alpha:
+        if image.format == "JPEG" and scale < 1.0:
+            image.draft("RGB", (tw, th))      # fast reduced-size JPEG decoding
+        image = image.convert("RGB")
+    if image.size != (tw, th):
+        image = image.resize((tw, th), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    if has_alpha:
+        image.save(buf, "PNG", optimize=True)
+        return Texture(buf.getvalue(), "image/png", ".png", (tw, th))
+    image.save(buf, "JPEG", quality=int(quality), optimize=True)
+    return Texture(buf.getvalue(), "image/jpeg", ".jpg", (tw, th))
+
+
+def encode_textures(parts, args, before=0):
+    """Encode each distinct image once; attach the result to the materials."""
+    done = {}
+    after = 0
+    sizes_in, sizes_out = set(), set()
+    for part in parts:
+        m = part.material
+        if m is None or m.image is None or part.uv is None:
+            continue
+        key = id(m.image)
+        if key not in done:
+            t = Timer()
+            width, height = m.image.size        # before encoding: draft-mode decoding shrinks the image object
+            done[key] = encode_texture(m.image, args.texture_size, args.texture_quality)
+            sizes_in.add(max(width, height))
+            sizes_out.add(max(done[key].size))
+            after += len(done[key].data)
+            if args.verbose:
+                log(f"texture {m.name}: {width}x{height} -> "
+                    f"{done[key].size[0]}x{done[key].size[1]}, {human_size(len(done[key].data))} ({t})")
+        m.texture = done[key]
+    if done:
+        log(f"textures: {len(done)} image{'s' if len(done) != 1 else ''}, longest side "
+            f"{max(sizes_in)} -> {max(sizes_out)} px, JPEG quality {args.texture_quality}"
+            + (f", {human_size(before)} -> {human_size(after)}" if before else ""))
+    return list(done.values())
+
+
+def texture_bytes_in_file(path):
+    """Bytes of texture images stored in (or next to) the input file; for reporting only."""
+    ext = ext_of(path)
+    base = os.path.dirname(os.path.abspath(path))
+    try:
+        if ext == ".glb":
+            with open(path, "rb") as f:
+                magic, _, _ = struct.unpack("<4sII", f.read(12))
+                if magic != b"glTF":
+                    return 0
+                length, _ = struct.unpack("<II", f.read(8))
+                js = json.loads(f.read(length))
+            views = js.get("bufferViews", [])
+            return sum(views[i["bufferView"]]["byteLength"] for i in js.get("images", []) if "bufferView" in i)
+        if ext == ".gltf":
+            with open(path) as f:
+                js = json.load(f)
+            total = 0
+            for image in js.get("images", []):
+                uri = image.get("uri")
+                if uri and not uri.startswith("data:") and os.path.exists(os.path.join(base, uri)):
+                    total += os.path.getsize(os.path.join(base, uri))
+                elif "bufferView" in image:
+                    total += js["bufferViews"][image["bufferView"]]["byteLength"]
+            return total
+        if ext == ".obj":
+            total, seen = 0, set()
+            with open(path, errors="replace") as f:
+                for _, line in zip(range(500), f):
+                    if not line.startswith("mtllib"):
+                        continue
+                    for mtl in line.split()[1:]:
+                        if not os.path.exists(os.path.join(base, mtl)):
+                            continue
+                        with open(os.path.join(base, mtl), errors="replace") as m:
+                            for mline in m:
+                                tok = mline.split()
+                                if len(tok) > 1 and tok[0].lower().startswith("map_"):
+                                    tex = os.path.join(base, tok[-1])
+                                    if tex not in seen and os.path.exists(tex):
+                                        seen.add(tex)
+                                        total += os.path.getsize(tex)
+            return total
+    except Exception:
+        return 0
+    return 0
+
+
+def bake_vertex_colors(part):
+    """Sample the texture at each vertex, for formats that only carry vertex colors."""
+    img = part.material.image.convert("RGB")
+    arr = np.asarray(img)
+    h, w = arr.shape[:2]
+    u = np.mod(part.uv[:, 0], 1.0)
+    v = np.mod(part.uv[:, 1], 1.0)
+    x = np.clip((u * w).astype(np.int64), 0, w - 1)
+    y = np.clip(((1.0 - v) * h).astype(np.int64), 0, h - 1)
+    rgb = arr[y, x]
+    return np.concatenate([rgb, np.full((len(rgb), 1), 255, np.uint8)], axis=1)
+
+
+# ------------------------------------------------------------------------------------------------
+# Writers
+# ------------------------------------------------------------------------------------------------
+
+GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER = 34962, 34963
+GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT, GL_UNSIGNED_INT, GL_FLOAT = 5121, 5123, 5125, 5126
+
+
+def write_glb(path, parts, textures, point_cloud=False):
+    buf = bytearray()
+    views, accessors = [], []
+
+    def add_view(data, target=None):
+        buf.extend(b"\0" * ((-len(buf)) % 4))
+        view = {"buffer": 0, "byteOffset": len(buf), "byteLength": len(data)}
+        if target is not None:
+            view["target"] = target
+        views.append(view)
+        buf.extend(data)
+        return len(views) - 1
+
+    def add_accessor(array, component_type, kind, target, normalized=False, bounds=False):
+        array = np.ascontiguousarray(array)
+        acc = {"bufferView": add_view(array.tobytes(), target), "componentType": component_type,
+               "count": int(len(array)), "type": kind}
+        if normalized:
+            acc["normalized"] = True
+        if bounds:
+            acc["min"] = [float(x) for x in array.min(axis=0)]
+            acc["max"] = [float(x) for x in array.max(axis=0)]
+        accessors.append(acc)
+        return len(accessors) - 1
+
+    texture_index = {id(t): i for i, t in enumerate(textures)}
+    images = [{"bufferView": add_view(t.data), "mimeType": t.mime} for t in textures]
+    materials, material_index, primitives = [], {}, []
+    for part in parts:
+        attrs = {"POSITION": add_accessor(part.vertices.astype(np.float32), GL_FLOAT, "VEC3",
+                                          GL_ARRAY_BUFFER, bounds=True)}
+        if part.normals is not None:
+            attrs["NORMAL"] = add_accessor(part.normals.astype(np.float32), GL_FLOAT, "VEC3",
+                                           GL_ARRAY_BUFFER)
+        m = part.material
+        tex = texture_index.get(id(m.texture)) if (m is not None and m.texture is not None) else None
+        if part.uv is not None and tex is not None:
+            uv = part.uv.astype(np.float32).copy()
+            uv[:, 1] = 1.0 - uv[:, 1]              # glTF puts the texture origin top-left
+            attrs["TEXCOORD_0"] = add_accessor(uv, GL_FLOAT, "VEC2", GL_ARRAY_BUFFER)
+        if part.colors is not None:
+            attrs["COLOR_0"] = add_accessor(part.colors.astype(np.uint8), GL_UNSIGNED_BYTE, "VEC4",
+                                            GL_ARRAY_BUFFER, normalized=True)
+        prim = {"attributes": attrs, "mode": 0 if point_cloud else 4}
+        if part.faces is not None:
+            if len(part.vertices) <= 65535:
+                prim["indices"] = add_accessor(part.faces.ravel().astype(np.uint16), GL_UNSIGNED_SHORT,
+                                               "SCALAR", GL_ELEMENT_ARRAY_BUFFER)
+            else:
+                prim["indices"] = add_accessor(part.faces.ravel().astype(np.uint32), GL_UNSIGNED_INT,
+                                               "SCALAR", GL_ELEMENT_ARRAY_BUFFER)
+        if m is not None:
+            key = (id(m), tex)
+            if key not in material_index:
+                pbr = {"metallicFactor": 0.0, "roughnessFactor": float(m.roughness)}
+                if tex is not None:
+                    pbr["baseColorTexture"] = {"index": tex}
+                if m.color is not None and (tex is None or tuple(m.color) != (1.0, 1.0, 1.0, 1.0)):
+                    pbr["baseColorFactor"] = [float(c) for c in m.color]
+                mat = {"name": m.name, "pbrMetallicRoughness": pbr}
+                if m.double_sided:
+                    mat["doubleSided"] = True
+                material_index[key] = len(materials)
+                materials.append(mat)
+            prim["material"] = material_index[key]
+        primitives.append(prim)
+
+    gltf = {"asset": {"version": "2.0", "generator": f"{PROGRAM} {VERSION}"},
+            "scene": 0, "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0, "name": os.path.splitext(os.path.basename(path))[0]}],
+            "meshes": [{"primitives": primitives}],
+            "accessors": accessors, "bufferViews": views, "buffers": [{"byteLength": 0}]}
+    if materials:
+        gltf["materials"] = materials
+    if textures:
+        gltf["images"] = images
+        gltf["textures"] = [{"source": i} for i in range(len(images))]
+    buf.extend(b"\0" * ((-len(buf)) % 4))
+    gltf["buffers"][0]["byteLength"] = len(buf)
+    js = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    js += b" " * ((-len(js)) % 4)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4sII", b"glTF", 2, 12 + 8 + len(js) + 8 + len(buf)))
+        f.write(struct.pack("<II", len(js), 0x4E4F534A))
+        f.write(js)
+        f.write(struct.pack("<II", len(buf), 0x004E4942))
+        f.write(buf)
+
+
+def write_texture_files(path, textures):
+    """Write textures next to an OBJ/PLY file; returns their file names."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    directory = os.path.dirname(path)
+    names = []
+    for i, t in enumerate(textures):
+        name = f"{stem}_texture_{i}{t.ext}"
+        with open(os.path.join(directory, name), "wb") as f:
+            f.write(t.data)
+        names.append(name)
+    return names
+
+
+def write_obj(path, parts, textures):
+    names = write_texture_files(path, textures)
+    texture_file = {id(t): n for t, n in zip(textures, names)}
+    stem = os.path.splitext(os.path.basename(path))[0]
+    mtl_name = stem + ".mtl"
+    materials = {}
+    for part in parts:
+        if part.material is not None and id(part.material) not in materials:
+            materials[id(part.material)] = part.material
+    with open(os.path.join(os.path.dirname(path), mtl_name), "w") as f:
+        f.write(f"# {PROGRAM} {VERSION}\n")
+        for i, m in enumerate(materials.values()):
+            color = m.color if m.color is not None else (1.0, 1.0, 1.0, 1.0)
+            f.write(f"\nnewmtl {mtl_safe(m.name, i)}\n")
+            f.write(f"Kd {color[0]:.4f} {color[1]:.4f} {color[2]:.4f}\nKa 0 0 0\nKs 0 0 0\nd 1\nillum 1\n")
+            if m.texture is not None and id(m.texture) in texture_file:
+                f.write(f"map_Kd {texture_file[id(m.texture)]}\n")
+    with open(path, "w") as f:
+        f.write(f"# {PROGRAM} {VERSION}\nmtllib {mtl_name}\n")
+        offset = 0
+        for pi, part in enumerate(parts):
+            f.write(f"o {part.name.replace(' ', '_')}_{pi}\n")
+            if part.colors is not None:
+                np.savetxt(f, np.hstack([part.vertices, part.colors[:, :3] / 255.0]),
+                           fmt="v %.6f %.6f %.6f %.4f %.4f %.4f")
+            else:
+                np.savetxt(f, part.vertices, fmt="v %.6f %.6f %.6f")
+            has_uv = part.uv is not None and part.material is not None and part.material.texture is not None
+            if has_uv:
+                np.savetxt(f, part.uv, fmt="vt %.6f %.6f")
+            if part.normals is not None:
+                np.savetxt(f, part.normals, fmt="vn %.4f %.4f %.4f")
+            if part.material is not None:
+                mi = list(materials).index(id(part.material))
+                f.write(f"usemtl {mtl_safe(part.material.name, mi)}\n")
+            idx = part.faces.astype(np.int64) + 1 + offset
+            if has_uv and part.normals is not None:
+                np.savetxt(f, idx[:, [0, 0, 0, 1, 1, 1, 2, 2, 2]], fmt="f %d/%d/%d %d/%d/%d %d/%d/%d")
+            elif has_uv:
+                np.savetxt(f, idx[:, [0, 0, 1, 1, 2, 2]], fmt="f %d/%d %d/%d %d/%d")
+            elif part.normals is not None:
+                np.savetxt(f, idx[:, [0, 0, 1, 1, 2, 2]], fmt="f %d//%d %d//%d %d//%d")
+            else:
+                np.savetxt(f, idx, fmt="f %d %d %d")
+            offset += len(part.vertices)
+
+
+def mtl_safe(name, index):
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+    return f"{safe or 'material'}_{index}"
+
+
+def write_ply(path, parts, with_normals):
+    """Binary PLY with positions, optional normals, vertex colors and faces."""
+    colored = any(p.colors is not None or (p.uv is not None and p.material is not None
+                                           and p.material.image is not None) for p in parts)
+    vfields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4")]
+    header = ["ply", "format binary_little_endian 1.0", f"comment {PROGRAM} {VERSION}"]
+    props = ["property float x", "property float y", "property float z"]
+    if with_normals:
+        vfields += [("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4")]
+        props += ["property float nx", "property float ny", "property float nz"]
+    if colored:
+        vfields += [("red", "u1"), ("green", "u1"), ("blue", "u1")]
+        props += ["property uchar red", "property uchar green", "property uchar blue"]
+    varrs, farrs, offset = [], [], 0
+    for part in parts:
+        varr = np.empty(len(part.vertices), dtype=np.dtype(vfields))
+        varr["x"], varr["y"], varr["z"] = part.vertices[:, 0], part.vertices[:, 1], part.vertices[:, 2]
+        if with_normals:
+            n = part.normals if part.normals is not None else np.zeros_like(part.vertices)
+            varr["nx"], varr["ny"], varr["nz"] = n[:, 0], n[:, 1], n[:, 2]
+        if colored:
+            if part.colors is not None:
+                c = part.colors
+            elif part.uv is not None and part.material is not None and part.material.image is not None:
+                c = bake_vertex_colors(part)
+            else:
+                c = np.full((len(part.vertices), 4), 255, np.uint8)
+            varr["red"], varr["green"], varr["blue"] = c[:, 0], c[:, 1], c[:, 2]
+        varrs.append(varr)
+        if part.faces is not None:
+            farr = np.empty(len(part.faces), dtype=np.dtype([("n", "u1"), ("v", "<i4", (3,))]))
+            farr["n"] = 3
+            farr["v"] = part.faces + offset
+            farrs.append(farr)
+        offset += len(part.vertices)
+    nverts = sum(len(v) for v in varrs)
+    nfaces = sum(len(f) for f in farrs)
+    header += [f"element vertex {nverts}"] + props
+    if nfaces or any(p.faces is not None for p in parts):
+        header += [f"element face {nfaces}", "property list uchar int vertex_indices"]
+    header += ["end_header", ""]
+    with open(path, "wb") as f:
+        f.write("\n".join(header).encode("ascii"))
+        for v in varrs:
+            f.write(v.tobytes())
+        for fa in farrs:
+            f.write(fa.tobytes())
+
+
+def write_stl(path, parts):
+    nfaces = sum(len(p.faces) for p in parts)
+    dtype = np.dtype([("normal", "<f4", (3,)), ("v", "<f4", (3, 3)), ("attr", "<u2")])
+    with open(path, "wb") as f:
+        f.write(f"{PROGRAM} {VERSION}".encode("ascii").ljust(80, b"\0"))
+        f.write(struct.pack("<I", nfaces))
+        for part in parts:
+            tri = part.vertices[part.faces].astype(np.float32)
+            n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+            length = np.linalg.norm(n, axis=1)
+            n[length > 0] /= length[length > 0, None]
+            arr = np.empty(len(tri), dtype=dtype)
+            arr["normal"], arr["v"], arr["attr"] = n, tri, 0
+            f.write(arr.tobytes())
+
+
+# ------------------------------------------------------------------------------------------------
+# Point clouds
+# ------------------------------------------------------------------------------------------------
+
+def poisson_subsample(vertices, colors, target, tmpdir):
+    """Evenly spaced subset of the points (MeshLab's Poisson-disk sampling), colors kept."""
+    import pymeshlab
+
+    pin = os.path.join(tmpdir, "points.ply")
+    pout = os.path.join(tmpdir, "sampled.ply")
+    write_interchange_ply(pin, vertices, np.zeros((0, 3), dtype=np.int32), None, None,
+                          None if colors is None else colors[:, :3], 0)
+    ms = pymeshlab.MeshSet()
+    ms.load_new_mesh(pin)
+    ms.generate_sampling_poisson_disk(samplenum=int(target), subsample=True)
+    got = ms.current_mesh().vertex_number()
+    if got > 0 and abs(got - target) > 0.02 * target:
+        # MeshLab's disk radius estimate is rough for point clouds, but the count it
+        # produces scales about linearly with the request, so one correction suffices
+        ms.set_current_mesh(0)
+        ms.generate_sampling_poisson_disk(samplenum=max(1, int(round(target * target / got))), subsample=True)
+    ms.save_current_mesh(pout, binary=True, save_vertex_color=colors is not None,
+                         save_vertex_normal=False, save_face_color=False)
+    v = read_interchange_ply(pout)["vertex"]
+    new_vertices = np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float32)
+    new_colors = None
+    if colors is not None and "red" in v.dtype.names:
+        new_colors = np.stack([v["red"], v["green"], v["blue"],
+                               np.full(len(v), 255, np.uint8)], axis=1).astype(np.uint8)
+    return new_vertices, new_colors
+
+
+def reduce_point_cloud(model, args):
+    vertices = np.concatenate([p.vertices for p in model.parts]).astype(np.float32)
+    colors = None
+    if model.colored:
+        colors = np.concatenate([p.colors if p.colors is not None
+                                 else np.full((len(p.vertices), 4), 255, np.uint8) for p in model.parts])
+    target = compute_target_faces(len(vertices), args)
+    if target < len(vertices):
+        t = Timer()
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"{PROGRAM}-") as tmpdir:
+                vertices, colors = poisson_subsample(vertices, colors, target, tmpdir)
+        except Exception as e:
+            warn(f"MeshLab Poisson-disk sampling failed ({e}); picking points at random instead")
+            keep = np.sort(np.random.default_rng(0).choice(len(vertices), size=target, replace=False))
+            vertices = vertices[keep]
+            if colors is not None:
+                colors = colors[keep]
+        log(f"subsampled points: {model.vertex_count:,} -> {len(vertices):,} "
+            f"({100.0 * len(vertices) / model.vertex_count:.1f}%)"
+            + (f" ({t})" if args.verbose else ""))
+    else:
+        log(f"no subsampling needed: {len(vertices):,} points is already within the target")
+    return [Part("points", vertices, None, colors=colors, material=Material("points"))]
+
+
+# ------------------------------------------------------------------------------------------------
+# Command line
+# ------------------------------------------------------------------------------------------------
+
+USAGE = f"""{PROGRAM} [options] inputfile outputfile
+       {PROGRAM} --info inputfile"""
+
+HELP = f"""Make a 3D model (typically a cave scan) smaller for sharing.
+
+usage: {USAGE}
+
+Input formats:  .glb .gltf .obj .ply .stl (and other formats trimesh can read)
+Output formats: .glb (recommended), .obj, .ply, .stl; point clouds: .ply, .glb
+
+Options:
+  --ratio R              Keep this fraction of the triangles (or points), 0 < R <= 1.
+                         Default 0.25. Use 1 for a lossless weld-and-repack only.
+  --faces N              Target number of triangles (or points); overrides --ratio.
+  --texture-size N       Shrink textures so that their longer side is at most N
+                         pixels. Default 2048; 0 keeps the original size.
+  --texture-quality Q    JPEG quality for the textures, 1-100. Default 80.
+  --min-part-size N      Remove disconnected fragments with fewer than N triangles.
+                         Default 0 (keep everything).
+  --weld-distance D      Also merge vertices closer than D model units (usually
+                         meters) to each other. Default 0 (exact duplicates only).
+  --no-weld              Do not merge duplicate vertices (not recommended).
+  --no-normals           Do not store vertex normals (smaller files, flat shading).
+  --info                 Print information about the input file and exit.
+  --force                Overwrite the output file without asking for confirmation.
+  --quiet                Print only warnings and errors.
+  --verbose              Print timing and per-texture details.
+  --help                 Print this message.
+  --version              Print version information.
+"""
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog=PROGRAM, usage=USAGE, add_help=False)
+    parser.add_argument("--ratio", type=float, default=0.25)
+    parser.add_argument("--faces", type=int, default=None)
+    parser.add_argument("--texture-size", type=int, default=2048)
+    parser.add_argument("--texture-quality", type=int, default=80)
+    parser.add_argument("--min-part-size", type=int, default=0)
+    parser.add_argument("--weld-distance", type=float, default=0.0)
+    parser.add_argument("--no-weld", dest="weld", action="store_false")
+    parser.add_argument("--no-normals", dest="normals", action="store_false")
+    parser.add_argument("--info", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--help", action="store_true")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("files", nargs="*")
+    args = parser.parse_args(argv)
+    if args.help:
+        print(HELP, end="")
+        sys.exit(0)
+    if args.version:
+        print(f"{PROGRAM} {VERSION}")
+        sys.exit(0)
+    if args.info:
+        if len(args.files) != 1:
+            fail(f"--info takes exactly one input file\nusage: {USAGE}")
+    elif len(args.files) != 2:
+        fail(f"expected an input file and an output file\nusage: {USAGE}")
+    if not (0 < args.ratio <= 1):
+        fail("--ratio must be between 0 (exclusive) and 1 (inclusive)")
+    if args.faces is not None and args.faces < 1:
+        fail("--faces must be positive")
+    if not (1 <= args.texture_quality <= 100):
+        fail("--texture-quality must be between 1 and 100")
+    if args.texture_size < 0 or args.weld_distance < 0 or args.min_part_size < 0:
+        fail("sizes and distances must not be negative")
+    return args
+
+
+def check_output(path, point_cloud, force):
+    ext = ext_of(path)
+    allowed = POINT_OUTPUT_FORMATS if point_cloud else MESH_OUTPUT_FORMATS
+    if ext not in allowed:
+        kind = "a point cloud" if point_cloud else "a mesh"
+        fail(f"cannot write {kind} as '{ext or path}'; use one of: {' '.join(allowed)}")
+    if os.path.exists(path) and not force:
+        print(f"{PROGRAM}: warning: output file '{path}' already exists.", file=sys.stderr)
+        if not sys.stdin.isatty():
+            fail("not overwriting (use --force)")
+        answer = input("Overwrite? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            fail("not overwriting")
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(directory):
+        fail(f"output directory '{directory}' does not exist")
+
+
+def main(argv=None):
+    global QUIET
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    QUIET = args.quiet
+    input_path = args.files[0]
+    if not os.path.isfile(input_path):
+        fail(f"input file '{input_path}' does not exist")
+    total = Timer()
+    input_size = os.path.getsize(input_path)
+    log(f"reading {input_path} ({human_size(input_size)})")
+    t = Timer()
+    model = load_model(input_path)
+    texture_bytes = texture_bytes_in_file(input_path) if model.textured else 0
+    log(f"input: {describe_model(model)}"
+        + (f" taking {human_size(texture_bytes)}" if texture_bytes else "")
+        + (f" ({t})" if args.verbose else ""))
+    if args.info:
+        return 0
+
+    output_path = args.files[1]
+    check_output(output_path, model.is_point_cloud, args.force)
+    out_ext = ext_of(output_path)
+
+    textures = []
+    textured_input, point_cloud = model.textured, model.is_point_cloud
+    if point_cloud:
+        parts = reduce_point_cloud(model, args)
+    else:
+        materials, mesh = combine_parts(model)
+        model.parts = []                # the per-part copies are no longer needed
+        gc.collect()
+        with tempfile.TemporaryDirectory(prefix=f"{PROGRAM}-") as tmpdir:
+            mesh = simplify_mesh(mesh, materials, args, tmpdir)
+        normals = vertex_normals(mesh["vertices"], mesh["faces"]) if args.normals else None
+        parts = split_by_material(mesh["vertices"], mesh["faces"], mesh["wedge"], mesh["texnumber"],
+                                  mesh["colors"], normals, materials)
+        if out_ext in (".glb", ".obj"):
+            textures = encode_textures(parts, args, before=texture_bytes)
+        elif textured_input:
+            log(f"note: {out_ext} output carries no textures; texture colors are baked into vertex colors"
+                if out_ext == ".ply" else f"note: {out_ext} output carries no textures or colors")
+
+    t = Timer()
+    if out_ext == ".glb":
+        write_glb(output_path, parts, textures, point_cloud=point_cloud)
+    elif out_ext == ".obj":
+        write_obj(output_path, parts, textures)
+    elif out_ext == ".ply":
+        write_ply(output_path, parts, with_normals=args.normals and not point_cloud)
+    elif out_ext == ".stl":
+        write_stl(output_path, parts)
+    output_size = os.path.getsize(output_path)
+    extra = ""
+    if out_ext == ".obj" and textures:
+        extra = f" plus {len(textures)} texture file{'s' if len(textures) != 1 else ''}"
+    log(f"wrote {output_path}: {human_size(output_size)}{extra} "
+        f"({100.0 * output_size / max(1, input_size):.1f}% of the input), {total} in total")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
